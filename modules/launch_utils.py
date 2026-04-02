@@ -391,7 +391,11 @@ def prepare_environment():
     startup_timer.record("torch GPU test")
 
     if not is_installed("clip"):
-        run_pip(f"install {clip_package}", "clip")
+        # openai/CLIP's legacy setup imports pkg_resources during the build.
+        # Modern isolated build environments can pull a setuptools release that
+        # no longer provides it, so install CLIP against the venv toolchain.
+        run_pip('install -U "setuptools<82" wheel', "build tools for clip")
+        run_pip(f"install --no-build-isolation {clip_package}", "clip")
         startup_timer.record("install clip")
 
     if not is_installed("open_clip"):

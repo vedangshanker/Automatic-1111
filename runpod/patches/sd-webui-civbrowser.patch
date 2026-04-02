@@ -1,0 +1,743 @@
+diff --git a/scripts/civsfz_api.py b/scripts/civsfz_api.py
+index 26b49e5..6ff96d6 100644
+--- a/scripts/civsfz_api.py
++++ b/scripts/civsfz_api.py
+@@ -17,7 +17,7 @@ from scripts.civsfz_filemanage import (
+     filename_normalization,
+ )
+ from scripts.civsfz_color import dictBasemodelColors
+-from scripts.civsfz_shared import GR_V440, opts, read_timeout, card_no_preview
++from scripts.civsfz_shared import GR_V440, opts, read_timeout, card_no_preview, get_civitai_api_key
+ from jinja2 import Environment, FileSystemLoader
+ 
+ print_ly = lambda  x: print(Fore.LIGHTYELLOW_EX + "CivBrowser: " + x + Style.RESET_ALL )
+@@ -1458,8 +1458,8 @@ class CivitaiModels(APIInformation):
+             # with CachedSession(cache_name=cachePath.resolve(), expire_after=5*60) as session:
+             browse = Browser()
+             if hasFavorites:
+-                api_key=getattr(opts,"civsfz_api_key", None)
+-                if api_key is None:
++                api_key = get_civitai_api_key()
++                if not api_key:
+                     print_ly(f"No API Key.")
+                 else:
+                     browse.setAPIKey(api_key)
+diff --git a/scripts/civsfz_downloader.py b/scripts/civsfz_downloader.py
+index 85fcedb..c5ed244 100644
+--- a/scripts/civsfz_downloader.py
++++ b/scripts/civsfz_downloader.py
+@@ -8,7 +8,7 @@ from collections import deque
+ from datetime import datetime, timedelta, timezone
+ from jinja2 import Environment, FileSystemLoader
+ from pathlib import Path
+-from threading import Thread, local
++from threading import Lock, Thread, local
+ from time import sleep
+ from tqdm import tqdm
+ from scripts.civsfz_shared import opts, calculate_sha256, read_timeout
+@@ -18,6 +18,7 @@ from scripts.civsfz_filemanage import (
+     extensionFolder,
+     open_folder,
+     filename_normalization,
++    type_path,
+ )
+ 
+ def print_ly(x): return print(Fore.LIGHTYELLOW_EX +
+@@ -35,6 +36,7 @@ class Downloader:
+     _dlResults = deque() # Download results
+     _maxThreadNum = 2
+     _threadNum = 0
++    _refresh_lock = Lock()
+ 
+     def __init__(self) -> None:
+         Downloader._thread_local.progress = 0
+@@ -149,6 +151,61 @@ class Downloader:
+             outputs=[],
+         )
+ 
++    @staticmethod
++    def _path_in_directory(path: Path, directory: Path) -> bool:
++        try:
++            path_abs = os.path.normcase(os.path.abspath(path))
++            dir_abs = os.path.normcase(os.path.abspath(directory))
++        except OSError:
++            return False
++
++        return path_abs == dir_abs or path_abs.startswith(dir_abs + os.sep)
++
++    def refresh_webui_state(self, file_path: Path):
++        refreshes = []
++
++        with Downloader._refresh_lock:
++            try:
++                if self._path_in_directory(file_path, type_path("Checkpoint")):
++                    from modules import shared
++
++                    shared.refresh_checkpoints()
++                    refreshes.append("checkpoints")
++
++                elif self._path_in_directory(file_path, type_path("VAE")):
++                    from modules import shared_items
++
++                    shared_items.refresh_vae_list()
++                    refreshes.append("vae")
++
++                elif any(
++                    self._path_in_directory(file_path, type_path(model_type))
++                    for model_type in ("LORA", "LoCon", "DoRA")
++                ):
++                    import networks
++
++                    networks.list_available_networks()
++                    refreshes.append("lora")
++
++                elif self._path_in_directory(file_path, type_path("Hypernetwork")):
++                    from modules import shared
++
++                    shared.reload_hypernetworks()
++                    refreshes.append("hypernetworks")
++
++                elif self._path_in_directory(file_path, type_path("TextualInversion")):
++                    from modules.sd_hijack import model_hijack
++
++                    model_hijack.embedding_db.load_textual_inversion_embeddings(force_reload=True)
++                    refreshes.append("embeddings")
++            except Exception as exc:
++                print_ly(f"Refresh failed for {file_path.name}: {exc}")
++
++        if refreshes:
++            print_lc(
++                f"Refreshed WebUI indexes after download: {', '.join(refreshes)}"
++            )
++
+     def download(self) -> None:
+         session = self.get_session()
+         result = "" # Success or Error
+@@ -310,6 +367,8 @@ class Downloader:
+                         print_ly("No hash value provided. Unable to confirm file.")
+                         result = "No hash value"
+                         # gr.Info(f"No hash: {file_name_display}")
++
++                    self.refresh_webui_state(Path(file_name))
+             # Downloader._dlQ.task_done()
+             Downloader._threadQ.remove(q)
+             q['result'] = result
+diff --git a/scripts/civsfz_settings.py b/scripts/civsfz_settings.py
+index cc7776c..3a2c454 100644
+--- a/scripts/civsfz_settings.py
++++ b/scripts/civsfz_settings.py
+@@ -49,7 +49,8 @@ def on_ui_settings():
+                 "The command line option `<em>--civsfz-api-key</em>` is deprecated. "
+                 "We felt that this was a risk because some users might not notice the API-Key being displayed on the console. "
+                 "The API-Key here is saved in the `<em>config.json</em>` file.</br>"
+-                "If you do not know this, there is a risk of your API-Key being leaked."
++                "If you do not know this, there is a risk of your API-Key being leaked.</br>"
++                "If you want to avoid saving it, set the environment variable `<em>CIVITAI_API_KEY</em>` before launch."
+             ),
+         }
+         if not platform == "SD.Next"
+@@ -62,7 +63,7 @@ def on_ui_settings():
+             label="API-Key",
+             component=gr.Textbox,
+             component_args={"type": "password"},
+-        ).info("Note: API-Key is stored in the `config.json` file."),
++        ).info("Note: API-Key is stored in the `config.json` file. If `CIVITAI_API_KEY` is set, it is used automatically."),
+         "civsfz_request_timeout": shared.OptionInfo(
+             30,
+             label="Request timeout(s)",
+@@ -84,25 +85,25 @@ def on_ui_settings():
+             component_args={"minimum": 1, "maximum": 8, "step": 1},
+         ).needs_reload_ui(),
+         "civsfz_number_of_cards": shared.OptionInfo(
+-            12,
++            100,
+             label="Number of cards per page",
+             component=gr.Slider,
+-            component_args={"minimum": 8, "maximum": 48, "step": 1},
+-        ),
++            component_args={"minimum": 8, "maximum": 100, "step": 1},
++        ).info("CivitAI's current models API accepts up to 100 results per request."),
+         "civsfz_card_size_width": shared.OptionInfo(
+-            8,
++            6,
+             label="Card width (unit:1em)",
+             component=gr.Slider,
+             component_args={"minimum": 5, "maximum": 30, "step": 1},
+         ),
+         "civsfz_card_size_height": shared.OptionInfo(
+-            12,
++            9,
+             label="Card height (unit:1em)",
+             component=gr.Slider,
+             component_args={"minimum": 5, "maximum": 30, "step": 1},
+         ),
+         "civsfz_hover_zoom_magnification": shared.OptionInfo(
+-            1.5,
++            1.12,
+             label="Zoom magnification when hovering",
+             component=gr.Slider,
+             component_args={"minimum": 1, "maximum": 2.4, "step": 0.1},
+diff --git a/scripts/civsfz_shared.py b/scripts/civsfz_shared.py
+index d9660fd..949bf93 100644
+--- a/scripts/civsfz_shared.py
++++ b/scripts/civsfz_shared.py
+@@ -1,3 +1,5 @@
++import os
++
+ VERSION = "v2.13.1"
+ 
+ platform = "A1111"
+@@ -65,6 +67,22 @@ except ImportError:
+ def read_timeout():
+     return 15, getattr(opts, "civsfz_request_timeout", 30)
+ 
++
++def get_civitai_api_key(runtime_value=None):
++    for candidate in (
++        runtime_value,
++        os.environ.get("CIVITAI_API_KEY"),
++        getattr(opts, "civsfz_api_key", ""),
++    ):
++        if candidate is None:
++            continue
++
++        api_key = str(candidate).strip()
++        if api_key:
++            return api_key[:32]
++
++    return ""
++
+ class HTML2txt(HTMLParser):
+     text = ""
+     prevEndTag = ""
+diff --git a/scripts/civsfz_ui.py b/scripts/civsfz_ui.py
+index 84d2d60..215d3a3 100644
+--- a/scripts/civsfz_ui.py
++++ b/scripts/civsfz_ui.py
+@@ -7,7 +7,7 @@ import re
+ from datetime import datetime, timedelta, timezone
+ from modules import script_callbacks, ui_components
+ from colorama import Fore, Back, Style
+-from scripts.civsfz_shared import VERSION, GR_V440, cmd_opts, opts, read_timeout, HTML2txt
++from scripts.civsfz_shared import VERSION, GR_V440, cmd_opts, opts, read_timeout, HTML2txt, get_civitai_api_key
+ from scripts.civsfz_api import CivitaiModels
+ from scripts.civsfz_filemanage import (
+     open_folder,
+@@ -43,9 +43,7 @@ class Components():
+         self.Civitai = CivitaiModels(tabId=self.id)
+         self.searchtype:list[str] = ["No"] # Remember previous search type
+         contentTypes = self.Civitai.getTypeOptions()
+-        self.APIKey = ""
+-        if opts.civsfz_api_key:
+-            self.APIKey = opts.civsfz_api_key[0:32]
++        self.APIKey = get_civitai_api_key()
+         def defaultContentType():
+             value = contentTypes[self.id % len(contentTypes)]
+             return value
+@@ -156,12 +154,14 @@ class Components():
+                         grBtnGetListAPI = gr.Button(
+                             value="GET cards",
+                             elem_id=f"civsfz_get_cards{self.id}",
++                            elem_classes="civsfz-btn civsfz-btn-primary",
+                             tooltip="Get model list and display as model cards",
+                         )
+                     with gr.Column(scale=2,min_width=80):
+                         grBtnPrevPage = gr.Button(
+                             value="PREV",
+                             elem_id=f"civsfz_previous_page{self.id}",
++                            elem_classes="civsfz-btn civsfz-btn-secondary",
+                             tooltip="Previous page",
+                             interactive=False,
+                         )
+@@ -169,39 +169,42 @@ class Components():
+                         grBtnNextPage = gr.Button(
+                             value="NEXT",
+                             elem_id=f"civsfz_next_page{self.id}",
++                            elem_classes="civsfz-btn civsfz-btn-secondary",
+                             tooltip="Next page",
+                             interactive=False,
+                         )
+                     with gr.Column(scale=1,min_width=80):
+-                        grTxtPages = gr.Textbox(label='Pages',show_label=False)
+-                with gr.Row():
+-                    grHtmlCards = gr.HTML()
++                        grTxtPages = gr.Textbox(label='Pages',show_label=False, elem_classes="civsfz-pages-pill")
++                with gr.Row(elem_classes="civsfz-card-grid-row"):
++                    grHtmlCards = gr.HTML(elem_classes="civsfz-card-grid-host")
+                     grTxtProperties = gr.Textbox(elem_id="civsfz_css-properties", label="CSS Properties", value="", visible=False, interactive=False, lines=1)
+-                with gr.Row(elem_classes="civsfz-jump-page-control civsfz-sticky-element"):
++                with gr.Row(elem_classes="civsfz-jump-page-control civsfz-sticky-element civsfz-jump-grid"):
+                     with gr.Column(scale=3):
+-                        grSldrPage = gr.Slider(label="Page", minimum=1, maximum=10,value = 1, step=1, interactive=False, scale=3)
++                        grSldrPage = gr.Slider(label="Page", minimum=1, maximum=10,value = 1, step=1, interactive=False, scale=3, elem_classes="civsfz-page-slider")
+                     with gr.Column(scale=1,min_width=80):
+                         grBtnGoPage = gr.Button(
+                             value="JUMP",
+                             elem_id=f"civsfz_jump_page{self.id}",
++                            elem_classes="civsfz-btn civsfz-btn-accent",
+                             interactive=False,
+                             scale=1,
+                             tooltip="Jump to the specified page. Can also be used to reload.",
+                         )
+-                    with gr.Accordion(label="Browsing Level", open=False):
++                    with gr.Accordion(label="Browsing Level", open=False, elem_classes="civsfz-browsing-level"):
+                         with gr.Column(min_width=80):
+                             grChkbxgrpLevel = gr.CheckboxGroup(label='Browsing Level', choices=list(self.Civitai.nsfwLevel.items()) ,value=opts.civsfz_browsing_level, interactive=True, show_label=False)
+ 
+             with gr.Column(elem_id=f"civsfz_model-data{self.id}"):
+                 with gr.Row():
+                     grHtmlModelName = gr.HTML(elem_id=f"civsfz_modellist{self.id}", value=None, visible=True)
+-                with gr.Row(elem_classes="civsfz-save-buttons civsfz-sticky-element"):
++                with gr.Row(elem_classes="civsfz-save-buttons civsfz-sticky-element civsfz-save-grid"):
+                     with gr.Column(scale=2):
+                         with gr.Row():
+                             # grBtnSaveText = gr.Button(value="Save trained tags",interactive=False, min_width=80)
+                             grBtnSaveImages = gr.Button(
+                                 value="Save model infos",
+                                 elem_id=f"civsfz_save_images{self.id}",
++                                elem_classes="civsfz-btn civsfz-btn-secondary",
+                                 tooltip="Save model information. Model file is not saved.",
+                                 interactive=False,
+                                 min_width=80,
+@@ -209,6 +212,7 @@ class Components():
+                             grBtnDownloadModel = gr.Button(
+                                 value="Download model",
+                                 elem_id=f"civsfz_downloadbutton{self.id}",
++                                elem_classes="civsfz-btn civsfz-btn-primary",
+                                 tooltip="Save model file",
+                                 interactive=False,
+                                 min_width=80,
+@@ -216,7 +220,7 @@ class Components():
+                     with gr.Column(scale=1):
+                         with gr.Row():
+                             grTextProgress = gr.Textbox(
+-                                label="Download status", show_label=False
++                                label="Download status", show_label=False, elem_classes="civsfz-download-status"
+                             )
+                             # deprecated grBtnCancel = gr.Button(value="Cancel",interactive=False, variant='stop', min_width=80)
+                 with gr.Row():
+diff --git a/style.css b/style.css
+index 992f93e..8ada456 100644
+--- a/style.css
++++ b/style.css
+@@ -5,19 +5,33 @@
+ 	--civsfz-shadow-color-alreadyhad: hsl(180, 60%, 30%, 0.8);
+ 	--civsfz-background-color-figcaption: hsl(225, 15%, 30% , 0.8);
+ 	--civsfz-background-color-early-access-in: hsl(225, 80%, 40%, 0.8);
+-	--civsfz-hover-scale: 1.5;
+-	--civsfz-card-width: 8;
+-	--civsfz-card-height: 12;
++	--civsfz-hover-scale: 1.12;
++	--civsfz-card-width: 6;
++	--civsfz-card-height: 9;
+ 	--civsfz-card-size-unit: 1em;
++	--civsfz-card-gap: 0.6rem;
++	--civsfz-panel-bg: rgba(17, 23, 34, 0.86);
++	--civsfz-panel-border: rgba(141, 162, 193, 0.18);
++	--civsfz-panel-shadow: 0 10px 30px rgba(0, 0, 0, 0.22);
++	--civsfz-control-height: 3rem;
++	--civsfz-radius: 16px;
++	--civsfz-radius-sm: 12px;
+ }
+ 
+ .civsfz-modellist {
+-	display: flex;
+-	flex-wrap: wrap;
++	display: grid;
++	grid-template-columns: repeat(
++		auto-fill,
++		minmax(calc(var(--civsfz-card-width) * var(--civsfz-card-size-unit)), 1fr)
++	);
++	gap: var(--civsfz-card-gap);
++	align-items: start;
++	padding: 0.25rem 0.1rem 0.9rem;
++	margin-top: 0.35rem;
+ }
+ 
+ .civsfz-modellist figure {
+-	margin: 4px;
++	margin: 0;
+ 	transition: transform .3s ease-out;
+ 	cursor: pointer;
+ }
+@@ -25,6 +39,10 @@
+ .civsfz-modelcard {
+ 	position: relative;
+ 	overflow: hidden;
++	width: 100%;
++	border-radius: 14px;
++	background: rgba(255, 255, 255, 0.04);
++	box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06);
+ }
+ 
+ .civsfz-modelcard:hover {
+@@ -33,20 +51,20 @@
+ 	overflow: visible;
+ 	/* need for z-index */
+ 	z-index: var(--layer-5);
+-	box-shadow: 0 0 4px 6px var(--civsfz-shadow-color-default);
++	box-shadow: 0 18px 34px rgba(0, 0, 0, 0.34), 0 0 0 2px var(--civsfz-shadow-color-default);
+ }
+ 
+ .civsfz-modelcardalreadyhave {
+-	box-shadow: 0 0 1px 4px var(--civsfz-shadow-color-alreadyhave);
++	box-shadow: 0 0 0 2px var(--civsfz-shadow-color-alreadyhave);
+ }
+ .civsfz-modelcardalreadyhave:hover {
+-	box-shadow: 0 0 4px 6px var(--civsfz-shadow-color-alreadyhave);
++	box-shadow: 0 18px 34px rgba(0, 0, 0, 0.34), 0 0 0 2px var(--civsfz-shadow-color-alreadyhave);
+ }
+ .civsfz-modelcardalreadyhad {
+-	box-shadow: 0 0 1px 4px var(--civsfz-shadow-color-alreadyhad);
++	box-shadow: 0 0 0 2px var(--civsfz-shadow-color-alreadyhad);
+ }
+ .civsfz-modelcardalreadyhad:hover {
+-	box-shadow: 0 0 4px 6px var(--civsfz-shadow-color-alreadyhad);
++	box-shadow: 0 18px 34px rgba(0, 0, 0, 0.34), 0 0 0 2px var(--civsfz-shadow-color-alreadyhad);
+ }
+ 
+ /*
+@@ -80,16 +98,18 @@
+ */
+ .civsfz-modelcard img {
+ 	/*filter: blur(6px);*/
+-	width:  calc(var(--civsfz-card-width) * var(--civsfz-card-size-unit));
++	width: 100%;
+ 	height: calc(var(--civsfz-card-height) * var(--civsfz-card-size-unit));
+ 	object-fit: cover;
++	display: block;
+ }
+ 
+ .civsfz-modelcard video {
+ 	/*filter: blur(6px);*/
+-	width:  calc(var(--civsfz-card-width) * var(--civsfz-card-size-unit));
++	width: 100%;
+ 	height: calc(var(--civsfz-card-height) * var(--civsfz-card-size-unit));
+ 	object-fit: cover;
++	display: block;
+ }
+ 
+ .civsfz-modelcard figcaption {
+@@ -98,79 +118,99 @@
+ 	left: 5px;
+ 	right: 5px;
+ 	word-break: break-word;
+-	background-color: var(--civsfz-background-color-figcaption);
+-	/*transition: bottom .3s ease-out;*/
++	background: linear-gradient(180deg, rgba(10, 14, 22, 0) 0%, var(--civsfz-background-color-figcaption) 28%);
++	padding: 1.35rem 0.45rem 0.35rem;
++	border-radius: 10px;
++	line-height: 1.18;
++	font-size: 0.82rem;
++	-webkit-line-clamp: 3;
++	line-clamp: 3;
++	display: -webkit-box;
++	-webkit-box-orient: vertical;
++	overflow: hidden;
+ 	max-height: 60%;
+ }
+ 
+ .civsfz-modelcard:hover figcaption {
+ 	bottom: initial;
+ 	max-height: initial;
++	-webkit-line-clamp: unset;
++	line-clamp: unset;
+ }
+ 
+ .civsfz-modelcard .civsfz-basemodel {
+ 	position: absolute;
+-	top: 0px;
+-	right: 0px;
++	top: 0.35rem;
++	right: 0.35rem;
+ 	word-break: break-word;
+-	font-size: smaller;
+-	max-width: 70%;
++	font-size: 0.65rem;
++	line-height: 1.15;
++	max-width: 76%;
+ 	text-align: right;
++	padding: 0.18rem 0.35rem;
++	border-radius: 999px;
++	backdrop-filter: blur(6px);
+ }
+ .civsfz-modelcard:hover .civsfz-basemodel {
+-	top: -1.5em;
++	top: -1.2em;
+ }
+ .civsfz-modelcard .civsfz-modeltype  {
+  	position: absolute;
+- 	top: 0px;
+- 	left: 0px;
++ 	top: 0.35rem;
++ 	left: 0.35rem;
+  	word-break: break-word;
+- 	font-size: smaller;
+-	background-color: var(--civsfz-background-color-figcaption);
++ 	font-size: 0.65rem;
++	background-color: rgba(11, 16, 24, 0.8);
++	padding: 0.18rem 0.35rem;
++	border-radius: 999px;
+  }
+ .civsfz-modelcard:hover .civsfz-modeltype {
+-	top: -1.5em;
++	top: -1.2em;
+ }
+ 
+ 
+ .civsfz-modelcard .civsfz-creator-flag {
+ 	position: absolute;
+-	bottom: 4px;
+-	right: -3px;
++	bottom: 0.25rem;
++	right: 0.15rem;
+ 	word-break: break-word;
+ 	/* color: gold; */
+-	font-size: x-large;
+-	text-shadow: -3px 3px 2px black;
++	font-size: 1.2rem;
++	text-shadow: -2px 2px 4px rgba(0, 0, 0, 0.8);
+ }
+ .civsfz-modelcard:hover .civsfz-creator-flag {
+-	bottom: -1em;
+-	right: -0.5em;
++	bottom: -0.65rem;
++	right: -0.15rem;
+ 	opacity: 90%;
+ 	transform:rotate(20deg);
+ }
+ 
+ .civsfz-modelcard .civsfz-early-access-out {
+ 	position: absolute;
+-	top: 1.4em;
+-	right: 0em;
+-	font-size: smaller;
++	top: 2rem;
++	right: 0.35rem;
++	font-size: 0.65rem;
+ 	background-color: var(--civsfz-early-access-out-background-color);
++	padding: 0.18rem 0.35rem;
++	border-radius: 999px;
+ }
+ .civsfz-modelcard:hover .civsfz-early-access-out {
+-	top: -1.5em;
+-	right: -1.2em;
++	top: -1.1em;
++	right: -0.8em;
+ }
+ .civsfz-modelcard .civsfz-early-access-in {
+ 	position: absolute;
+-	top: 1.4em;
+-	right: 0em;
++	top: 2rem;
++	right: 0.35rem;
+ 	word-break: break-word;
+-	font-size: smaller;
++	font-size: 0.65rem;
+ 	background-color: var(--civsfz-background-color-early-access-in);
++	padding: 0.18rem 0.35rem;
++	border-radius: 999px;
+ }
+ .civsfz-modelcard:hover .civsfz-early-access-in {
+-	top: -1.5em;
+-	right: -1.2em;
++	top: -1.1em;
++	right: -0.8em;
+ }
+ 
+ .civsfz-nsfw img {
+@@ -201,6 +241,15 @@
+ 	position: sticky;
+ 	top: 3em;
+ 	z-index: 1;
++	display: grid;
++	grid-template-columns: minmax(12rem, 2.25fr) repeat(2, minmax(8rem, 1fr)) minmax(4.6rem, auto);
++	gap: 0.75rem;
++	align-items: center;
++	padding: 0.75rem;
++	border: 1px solid var(--civsfz-panel-border);
++	border-radius: var(--civsfz-radius);
++	background: linear-gradient(180deg, rgba(34, 44, 62, 0.72), rgba(15, 20, 30, 0.92));
++	box-shadow: var(--civsfz-panel-shadow);
+ }
+ [id^="civsfz_model-navigation"] .civsfz-jump-page-control {
+ 	position: -webkit-sticky;
+@@ -208,31 +257,46 @@
+ 	position: sticky;
+ 	bottom: 0px;
+ 	z-index: 1;
++	display: grid;
++	grid-template-columns: minmax(0, 1fr) minmax(8rem, auto) minmax(15rem, 19rem);
++	gap: 0.75rem;
++	align-items: end;
++	padding: 0.75rem;
++	margin-top: 0.5rem;
++	border: 1px solid var(--civsfz-panel-border);
++	border-radius: var(--civsfz-radius);
++	background: linear-gradient(180deg, rgba(34, 44, 62, 0.66), rgba(15, 20, 30, 0.9));
++	box-shadow: var(--civsfz-panel-shadow);
+ }
+ [id^="civsfz_model-data"] .civsfz-save-buttons {
+ 	position: -webkit-sticky; /* Safari */
+ 	position: sticky;
+ 	top: 3em;
+ 	z-index: 1;
++	padding: 0.75rem;
++	border: 1px solid var(--civsfz-panel-border);
++	border-radius: var(--civsfz-radius);
++	background: linear-gradient(180deg, rgba(34, 44, 62, 0.66), rgba(15, 20, 30, 0.9));
++	box-shadow: var(--civsfz-panel-shadow);
+ }
+ [id^="civsfz_tab_item"] .civsfz-anchor-nav {
+ 	text-align: right;
+ 	position: -webkit-sticky; /* Safari */
+ 	position:sticky;
+-	top: 7em;
+-	right: 2em;
++	top: 9.25rem;
++	right: 0.85rem;
+ 	z-index: 2;
+ 	float: inline-end;
+ 	pointer-events: none;
+ 	height: 0em;
+-	margin-right: -2em;
++	margin-right: 0;
+ }
+ .civsfz-sticky-parent {
+ 	display: initial;
+ }
+ .civsfz-sticky-element {
+-	backdrop-filter: brightness(0.35);
+-	padding: 0.5em 0;
++	backdrop-filter: blur(10px) brightness(0.55);
++	padding: 0.25rem;
+ }
+ /*https: //github.com/gradio-app/gradio/issues/3337#issuecomment-1449589285*/
+ .civsfz-small-buttons {
+@@ -279,3 +343,126 @@
+ .civsfz-tooltip:hover .civsfz-tooltiptext {
+ 	visibility: visible;
+ }
++
++[id^="civsfz_model-navigation"] .civsfz-navigation-buttons > div,
++[id^="civsfz_model-navigation"] .civsfz-jump-page-control > div,
++[id^="civsfz_model-data"] .civsfz-save-buttons > div {
++	min-width: 0;
++}
++
++[id^="civsfz_apicontrol"] .civsfz-btn button,
++[id^="civsfz_model-navigation"] .civsfz-btn button,
++[id^="civsfz_model-data"] .civsfz-btn button {
++	min-height: var(--civsfz-control-height);
++	border-radius: var(--civsfz-radius-sm);
++	font-weight: 700;
++	letter-spacing: 0.01em;
++	box-shadow: none;
++}
++
++[id^="civsfz_apicontrol"] .civsfz-btn-primary button,
++[id^="civsfz_model-data"] .civsfz-btn-primary button {
++	background: linear-gradient(180deg, rgba(92, 124, 179, 0.92), rgba(58, 83, 126, 0.98));
++	border: 1px solid rgba(173, 197, 235, 0.24);
++}
++
++[id^="civsfz_apicontrol"] .civsfz-btn-secondary button,
++[id^="civsfz_model-data"] .civsfz-btn-secondary button,
++[id^="civsfz_model-navigation"] .civsfz-btn-secondary button {
++	background: rgba(49, 58, 72, 0.96);
++	border: 1px solid rgba(171, 186, 214, 0.12);
++}
++
++[id^="civsfz_model-navigation"] .civsfz-btn-accent button {
++	background: linear-gradient(180deg, rgba(83, 99, 132, 0.96), rgba(66, 79, 108, 0.98));
++	border: 1px solid rgba(173, 197, 235, 0.16);
++}
++
++[id^="civsfz_model-navigation"] .civsfz-pages-pill textarea,
++[id^="civsfz_model-navigation"] .civsfz-pages-pill input,
++[id^="civsfz_model-data"] .civsfz-download-status textarea,
++[id^="civsfz_model-data"] .civsfz-download-status input {
++	min-height: var(--civsfz-control-height);
++	border-radius: var(--civsfz-radius-sm);
++	text-align: center;
++	font-weight: 600;
++	background: rgba(25, 30, 39, 0.94);
++}
++
++[id^="civsfz_model-navigation"] .civsfz-pages-pill {
++	min-width: 4.75rem;
++}
++
++[id^="civsfz_model-navigation"] .civsfz-card-grid-row {
++	margin-top: 0.4rem;
++}
++
++[id^="civsfz_model-navigation"] .civsfz-card-grid-host {
++	width: 100%;
++}
++
++[id^="civsfz_model-navigation"] .civsfz-page-slider {
++	padding-top: 0.1rem;
++}
++
++[id^="civsfz_model-navigation"] .civsfz-page-slider label,
++[id^="civsfz_model-navigation"] .civsfz-browsing-level label {
++	font-size: 0.82rem;
++	opacity: 0.92;
++}
++
++[id^="civsfz_model-navigation"] .civsfz-browsing-level {
++	margin: 0;
++	border-radius: var(--civsfz-radius-sm);
++	background: rgba(11, 16, 24, 0.34);
++	border: 1px solid rgba(171, 186, 214, 0.1);
++	padding: 0.1rem 0.35rem;
++}
++
++[id^="civsfz_model-navigation"] .civsfz-browsing-level .label-wrap {
++	margin-bottom: 0.2rem;
++}
++
++[id^="civsfz_model-data"] .civsfz-save-grid {
++	display: grid;
++	grid-template-columns: minmax(0, 2fr) minmax(16rem, 1fr);
++	gap: 0.75rem;
++	align-items: center;
++}
++
++[id^="civsfz_model-data"] .civsfz-save-grid > div:first-child .gradio-row {
++	gap: 0.75rem;
++}
++
++[id^="civsfz_model-data"] .civsfz-download-status {
++	width: 100%;
++}
++
++[id^="civsfz_tab_item"] .civsfz-anchor-nav > div {
++	display: flex;
++	align-items: center;
++	justify-content: center;
++	width: 2.6rem;
++	height: 2.6rem;
++	margin-bottom: 0.45rem;
++	border-radius: 14px;
++	background: rgba(22, 29, 43, 0.88);
++	border: 1px solid rgba(171, 186, 214, 0.14);
++	box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
++	pointer-events: auto;
++}
++
++@media (max-width: 1280px) {
++	[id^="civsfz_model-navigation"] .civsfz-navigation-buttons {
++		grid-template-columns: minmax(10rem, 1.8fr) repeat(2, minmax(7rem, 1fr)) minmax(4.2rem, auto);
++	}
++
++	[id^="civsfz_model-navigation"] .civsfz-jump-page-control,
++	[id^="civsfz_model-data"] .civsfz-save-grid {
++		grid-template-columns: 1fr;
++	}
++
++	[id^="civsfz_tab_item"] .civsfz-anchor-nav {
++		top: 10.75rem;
++	}
++}
