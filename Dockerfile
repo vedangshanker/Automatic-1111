@@ -44,10 +44,7 @@ RUN python launch.py \
     --no-download-sd-model \
     --exit
 
-RUN rm -rf /root/.cache /tmp/* && \
-    chown -R app:app /opt/stable-diffusion-webui /opt/webui-seed /opt/venv
-
-USER app
+RUN rm -rf /root/.cache /tmp/*
 
 EXPOSE 7860
 
