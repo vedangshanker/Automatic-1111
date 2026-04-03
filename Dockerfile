@@ -3,6 +3,7 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    TINI_SUBREAPER=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     STABLE_DIFFUSION_REPO=https://github.com/w-e-w/stablediffusion.git
@@ -50,6 +51,5 @@ USER app
 
 EXPOSE 7860
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["bash", "/opt/stable-diffusion-webui/runpod/start.sh"]
-

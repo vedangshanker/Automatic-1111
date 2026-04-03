@@ -64,6 +64,9 @@ Use --skip-python-version-check to suppress this warning.
 
 @lru_cache()
 def commit_hash():
+    if not os.path.isdir(os.path.join(script_path, ".git")):
+        return "<none>"
+
     try:
         return subprocess.check_output([git, "-C", script_path, "rev-parse", "HEAD"], shell=False, encoding='utf8').strip()
     except Exception:
@@ -72,6 +75,15 @@ def commit_hash():
 
 @lru_cache()
 def git_tag():
+    if not os.path.isdir(os.path.join(script_path, ".git")):
+        try:
+            changelog_md = os.path.join(script_path, "CHANGELOG.md")
+            with open(changelog_md, "r", encoding="utf-8") as file:
+                line = next((line.strip() for line in file if line.strip()), "<none>")
+                return line.replace("## ", "")
+        except Exception:
+            return "<none>"
+
     try:
         return subprocess.check_output([git, "-C", script_path, "describe", "--tags"], shell=False, encoding='utf8').strip()
     except Exception:

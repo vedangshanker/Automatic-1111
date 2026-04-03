@@ -49,6 +49,7 @@ ARGS=(
     --api
     --enable-insecure-extension-access
     --skip-python-version-check
+    --skip-torch-cuda-test
     --no-download-sd-model
     --data-dir "$DATA_DIR"
     --models-dir "$MODELS_DIR"
@@ -68,4 +69,3 @@ fi
 
 cd "$APP_DIR"
 exec "$PYTHON_BIN" launch.py "${ARGS[@]}"
-
